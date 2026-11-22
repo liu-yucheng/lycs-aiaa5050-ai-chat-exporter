@@ -1,14 +1,14 @@
 // ==UserScript==
 // @name         AIAA5050 AI Chat Exporter
 // @namespace    lycs-aiaa5050-ai-chat-exporter
-// @version      1.0.0
+// @version      1.1.0
 // @description  Export selected AI chat messages to a standalone HTML file.
 // @author       Yucheng LIU
 // @license      AGPL-3.0-or-later
 // @match        https://chat.deepseek.com/a/chat/s/*
 // @match        https://chat.deepseek.com/share/*
 // @match        https://chat.qwen.ai/c/*
-// @match        https://www.qianwen.com/chat
+// @match        https://www.qianwen.com/chat/
 // @match        https://www.qianwen.com/chat/*
 // @run-at       document-idle
 // @grant        GM_xmlhttpRequest
@@ -192,6 +192,7 @@ a { color: #2563eb; text-decoration: underline; text-underline-offset: 2px; }
   height: auto;
   border-radius: 9px;
 }
+.message-content img.video-preview { max-height: 360px; width: auto; }
 .message-content audio { max-width: 100%; }
 .message-content .task-checkbox { margin-right: .3em; }
 .message-content .attachment-gallery {
@@ -632,8 +633,67 @@ body.theme-compact .message-content { font-size: 14px; line-height: 1.6; }
     return !!el.closest('aside, nav, header, [id*="sidebar" i], [data-testid*="sidebar" i], [class~="sidebar"], [class^="sidebar-"], [class*=" sidebar-"]');
   }
 
+  function elementBackgroundSource(el) {
+    if (!el || el.nodeType !== 1) return '';
+    if (/^(IMG|VIDEO|AUDIO|CANVAS|SOURCE|PICTURE)$/.test(el.tagName)) return '';
+    const inline = el.style && el.style.backgroundImage ? el.style.backgroundImage : '';
+    const label = `${el.getAttribute('role') || ''} ${el.getAttribute('aria-label') || ''}`;
+    const classHint = /image|img|photo|picture|thumb|preview|media|poster|cover/i.test(classText(el))
+      || /img|image|photo|picture/i.test(label);
+    let value = inline;
+    if (!value && classHint && typeof getComputedStyle === 'function') {
+      try {
+        value = getComputedStyle(el).backgroundImage || '';
+      } catch {
+        value = '';
+      }
+    }
+    if (!value || /^(none|initial|inherit)$/i.test(value.trim()) || /gradient/i.test(value)) return '';
+    const match = /url\((['"]?)([^'")]+)\1\)/i.exec(value);
+    return match ? match[2].trim() : '';
+  }
+
   function hasMedia(el) {
-    return !!el.querySelector('img, video, audio');
+    if (!el || !el.querySelector) return false;
+    if (el.querySelector('img, video, audio, canvas, picture, [style*="background-image"]')) return true;
+    const candidates = el.querySelectorAll('[class*="image"], [class*="img"], [class*="thumb"], [class*="preview"]');
+    for (const candidate of candidates) {
+      if (elementBackgroundSource(candidate)) return true;
+    }
+    return false;
+  }
+
+  function markerRolesIn(el, adapter) {
+    const roles = new Set();
+    for (const rule of adapter.markerRules || []) {
+      if (el.matches && el.matches(rule.selector) && !isInChrome(el)) roles.add(rule.role || 'message');
+      for (const marker of el.querySelectorAll(rule.selector)) {
+        if (!isInChrome(marker)) roles.add(rule.role || 'message');
+      }
+    }
+    return roles;
+  }
+
+  function findMessageWrapper(el, adapter) {
+    if (!el) return el;
+    const selectors = [
+      '.ds-message',
+      '[data-virtual-list-item-key]',
+      '.chat-round',
+      '[class*="message-row"]',
+      '[class*="message-item"]',
+      '[class*="chat-message"]'
+    ];
+    for (const selector of selectors) {
+      let found = null;
+      try {
+        found = el.closest(selector);
+      } catch {
+        found = null;
+      }
+      if (found && !isInChrome(found) && markerRolesIn(found, adapter).size <= 1) return found;
+    }
+    return el;
   }
 
   function compareDocumentOrder(a, b) {
@@ -661,6 +721,57 @@ body.theme-compact .message-content { font-size: 14px; line-height: 1.6; }
     return first.split(/\s+/)[0] || '';
   }
 
+  function isPlaceholderImageSource(value) {
+    const text = String(value || '').trim();
+    if (!text) return true;
+    if (/^data:image\/gif;base64,R0lGOD/i.test(text)) return true;
+    if (/^data:image\/(?:gif|png);base64,[A-Za-z0-9+/=]{0,96}$/i.test(text)) return true;
+    return false;
+  }
+
+  function imageSource(img) {
+    if (!img) return '';
+    const current = img.currentSrc || img.src || '';
+    const lazy = img.getAttribute('data-src') || img.getAttribute('data-original')
+      || img.getAttribute('data-lazy-src') || img.getAttribute('data-actualsrc')
+      || firstSrcFromSrcset(img.getAttribute('data-srcset'))
+      || firstSrcFromSrcset(img.getAttribute('srcset'));
+    const width = img.naturalWidth || 0;
+    const height = img.naturalHeight || 0;
+    const tiny = width > 0 && width <= 32 && height > 0 && height <= 32;
+    if (lazy && (isPlaceholderImageSource(current) || tiny)) return lazy;
+    if (current) return current;
+    return lazy || '';
+  }
+
+  function canvasDataUrl(canvas) {
+    try {
+      const dataUrl = canvas && canvas.toDataURL ? canvas.toDataURL('image/png') : '';
+      if (/^data:image\/[a-z]+;base64,/i.test(dataUrl) && dataUrl.length > 64) return dataUrl;
+    } catch {
+      return '';
+    }
+    return '';
+  }
+
+  function loadedImageDataUrl(img) {
+    try {
+      const width = img && (img.naturalWidth || img.width || 0);
+      const height = img && (img.naturalHeight || img.height || 0);
+      if (!width || !height) return '';
+      const canvas = document.createElement('canvas');
+      canvas.width = width;
+      canvas.height = height;
+      const context = canvas.getContext('2d');
+      if (!context) return '';
+      context.drawImage(img, 0, 0, width, height);
+      const dataUrl = canvas.toDataURL('image/png');
+      return /^data:image\//i.test(dataUrl) ? dataUrl : '';
+    } catch {
+      return '';
+    }
+  }
+
   function detectAdapter() {
     const host = location.hostname.replace(/^www\./, '').toLowerCase();
     if (host === 'chat.deepseek.com') return ADAPTERS.deepseek;
@@ -683,6 +794,11 @@ body.theme-compact .message-content { font-size: 14px; line-height: 1.6; }
       : (root.querySelector('.ds-assistant-message-main-content') || root.querySelector('.ds-markdown'));
     if (assistant && !assistant.closest('.ds-think-content') && (!user || !user.contains(assistant))) {
       const message = makeMessage('assistant', assistant, root, ADAPTERS.deepseek);
+      if (message) out.push(message);
+    }
+    if (!out.length && hasMedia(root)) {
+      const content = root.querySelector('.ds-collapsible-text') || root;
+      const message = makeMessage('user', content, root, ADAPTERS.deepseek);
       if (message) out.push(message);
     }
     return out;
@@ -709,7 +825,8 @@ body.theme-compact .message-content { font-size: 14px; line-height: 1.6; }
       return out;
     }
 
-    const isUser = /qwen-chat-message-user/.test(classText(root)) || !!root.querySelector('.chat-user-message');
+    const isUser = /qwen-chat-message-user/.test(classText(root))
+      || !!root.querySelector('.chat-user-message, .chat-user-message-wrapper, .chat-user-message-container');
     const isAssistant = /qwen-chat-message-assistant/.test(classText(root)) || !!root.querySelector('.response-message-content');
 
     if (isUser) {
@@ -733,7 +850,7 @@ body.theme-compact .message-content { font-size: 14px; line-height: 1.6; }
     if (!out.length) {
       const content = findBestContent(root, ADAPTERS.qwen.contentSelectors);
       if (content) {
-        const role = detectRole(root, ADAPTERS.qwen) || 'assistant';
+        const role = detectRole(root, ADAPTERS.qwen) || (isUser ? 'user' : 'assistant');
         const message = makeMessage(role, content, root, ADAPTERS.qwen);
         if (message) out.push(message);
       }
@@ -869,8 +986,9 @@ body.theme-compact .message-content { font-size: 14px; line-height: 1.6; }
   function makeMessage(role, contentNode, rootNode, adapter) {
     if (!contentNode || !contentNode.isConnected) return null;
     if (isInChrome(contentNode)) return null;
+    const mediaRoot = findMessageWrapper(rootNode || contentNode, adapter);
     const text = normalizeText(contentNode.innerText || contentNode.textContent || '');
-    const media = hasMedia(contentNode) || (rootNode && hasMedia(rootNode));
+    const media = hasMedia(contentNode) || hasMedia(mediaRoot);
     if (!text && !media) return null;
     if (isNoticeText(text) && !media) return null;
     if (isJunkMessage(text)) return null;
@@ -878,7 +996,7 @@ body.theme-compact .message-content { font-size: 14px; line-height: 1.6; }
     return {
       role: role === 'user' ? 'user' : 'assistant',
       contentNode,
-      rootNode: rootNode || contentNode,
+      rootNode: mediaRoot,
       preview: truncate(preview, 220),
       selected: true,
       plain: role === 'user',
@@ -1034,28 +1152,60 @@ body.theme-compact .message-content { font-size: 14px; line-height: 1.6; }
   }
 
   function sanitizeNode(node, baseUrl) {
+    if (node && node.tagName === 'CANVAS') {
+      const dataUrl = canvasDataUrl(node);
+      if (dataUrl) {
+        const img = document.createElement('img');
+        img.setAttribute('src', dataUrl);
+        const alt = node.getAttribute('aria-label') || node.getAttribute('title') || '';
+        if (alt) img.setAttribute('alt', alt);
+        return sanitizeNode(img, baseUrl);
+      }
+    }
     const originalImages = Array.from(node.querySelectorAll ? node.querySelectorAll('img') : []);
-    const originalImageSources = originalImages.map((img) => {
-      if (img.currentSrc) return img.currentSrc;
-      if (img.src) return img.src;
-      const dataSrc = img.getAttribute('data-src') || img.getAttribute('data-original') || img.getAttribute('data-lazy-src');
-      return dataSrc || firstSrcFromSrcset(img.getAttribute('srcset'));
-    });
-    const rootImageSource = node.tagName === 'IMG'
-      ? (node.currentSrc || node.src || node.getAttribute('data-src') || node.getAttribute('data-original')
-        || node.getAttribute('data-lazy-src') || firstSrcFromSrcset(node.getAttribute('srcset')))
-      : '';
+    const originalImageSources = originalImages.map((img) => imageSource(img));
+    const rootImageSource = node.tagName === 'IMG' ? imageSource(node) : '';
 
     const clone = node.cloneNode(true);
 
     if (clone.tagName === 'IMG') {
-      if (rootImageSource) clone.setAttribute('src', toAbsoluteUrl(rootImageSource, baseUrl));
+      clone.__aiceSourceImage = node;
+      if (rootImageSource) {
+        const dataUrl = /^blob:/i.test(rootImageSource) ? loadedImageDataUrl(node) : '';
+        clone.setAttribute('src', dataUrl || toAbsoluteUrl(rootImageSource, baseUrl));
+      }
     } else {
       const clonedImages = Array.from(clone.querySelectorAll ? clone.querySelectorAll('img') : []);
       clonedImages.forEach((img, index) => {
         const src = originalImageSources[index];
-        if (src) img.setAttribute('src', toAbsoluteUrl(src, baseUrl));
+        const original = originalImages[index];
+        img.__aiceSourceImage = original;
+        if (!src) return;
+        const dataUrl = /^blob:/i.test(src) ? loadedImageDataUrl(original) : '';
+        img.setAttribute('src', dataUrl || toAbsoluteUrl(src, baseUrl));
       });
+    }
+
+    const originalElements = [node, ...(node.querySelectorAll ? Array.from(node.querySelectorAll('*')) : [])];
+    const clonedElements = [clone, ...(clone.querySelectorAll ? Array.from(clone.querySelectorAll('*')) : [])];
+    for (let index = 0; index < originalElements.length; index += 1) {
+      const original = originalElements[index];
+      const cloned = clonedElements[index];
+      if (original && cloned && original.tagName === 'VIDEO' && cloned.tagName === 'VIDEO') {
+        cloned.__aiceSourceVideo = original;
+      }
+    }
+    for (let index = 0; index < originalElements.length; index += 1) {
+      const original = originalElements[index];
+      const cloned = clonedElements[index];
+      if (!original || !cloned || cloned.tagName !== 'CANVAS') continue;
+      const dataUrl = canvasDataUrl(original);
+      if (!dataUrl) continue;
+      const img = document.createElement('img');
+      img.setAttribute('src', dataUrl);
+      const alt = original.getAttribute('aria-label') || original.getAttribute('title') || '';
+      if (alt) img.setAttribute('alt', alt);
+      cloned.replaceWith(img);
     }
 
     const checkboxInputs = Array.from(clone.querySelectorAll ? clone.querySelectorAll('input[type="checkbox"]') : []);
@@ -1196,6 +1346,27 @@ body.theme-compact .message-content { font-size: 14px; line-height: 1.6; }
       }
     }
 
+    const seenBackgrounds = new Set();
+    for (let index = 0; index < originalElements.length; index += 1) {
+      const original = originalElements[index];
+      const cloned = clonedElements[index];
+      if (!original || !cloned) continue;
+      if (cloned !== clone && !clone.contains(cloned)) continue;
+      if (/^(IMG|VIDEO|AUDIO|CANVAS|SOURCE|PICTURE)$/.test(original.tagName)) continue;
+      if (!isLikelyContentMedia(original)) continue;
+      const background = elementBackgroundSource(original);
+      if (!background) continue;
+      const absolute = toAbsoluteUrl(background, baseUrl);
+      if (!absolute || seenBackgrounds.has(absolute)) continue;
+      seenBackgrounds.add(absolute);
+      const img = document.createElement('img');
+      img.setAttribute('src', absolute);
+      img.setAttribute('loading', 'lazy');
+      const alt = original.getAttribute('aria-label') || original.getAttribute('title') || '';
+      if (alt) img.setAttribute('alt', alt);
+      cloned.insertBefore(img, cloned.firstChild);
+    }
+
     if (clone.tagName === 'IMG') {
       const src = rootImageSource || clone.getAttribute('src') || '';
       if (src) {
@@ -1212,46 +1383,150 @@ body.theme-compact .message-content { font-size: 14px; line-height: 1.6; }
   function isLikelyContentMedia(el) {
     if (!el || !el.isConnected) return false;
     if (el.closest('[class*="avatar"], [class*="icon"], [class*="emoji"], [class*="logo"]')) return false;
+    const cls = classText(el).toLowerCase();
     if (el.tagName === 'IMG') {
       const width = el.naturalWidth || el.width || 0;
       const height = el.naturalHeight || el.height || 0;
       if (width && height && width <= 32 && height <= 32) return false;
-      const cls = classText(el).toLowerCase();
+      if (/avatar|icon|emoji|logo/.test(cls)) return false;
+    } else if (el.tagName === 'CANVAS') {
+      const width = el.width || 0;
+      const height = el.height || 0;
+      if (width && height && width <= 32 && height <= 32) return false;
+    } else {
+      const width = el.offsetWidth || 0;
+      const height = el.offsetHeight || 0;
+      if (width && height && width <= 32 && height <= 32) return false;
       if (/avatar|icon|emoji|logo/.test(cls)) return false;
     }
     return true;
   }
 
-  function appendExtraMedia(wrapper, rootNode, contentNode, baseUrl) {
+  function collectAdjacentMedia(contentNode, role, adapter) {
+    const media = [];
+    const seen = new Set();
+    const addElement = (el) => {
+      if (!el || seen.has(el)) return;
+      seen.add(el);
+      if (!isLikelyContentMedia(el)) return;
+      if (/^(IMG|VIDEO|AUDIO|CANVAS)$/.test(el.tagName)) {
+        media.push({ kind: 'element', el });
+        return;
+      }
+      if (elementBackgroundSource(el)) media.push({ kind: 'background', el });
+    };
+    const addWithin = (container) => {
+      for (const el of Array.from(container.querySelectorAll('img, video, audio, canvas'))) addElement(el);
+      const backgroundSelector = '[style*="background-image"], [class*="image"], [class*="img"]';
+      for (const el of Array.from(container.querySelectorAll(backgroundSelector))) addElement(el);
+    };
+    let node = contentNode;
+    for (let depth = 0; node && node.parentElement && depth < 3; depth += 1) {
+      const parent = node.parentElement;
+      const children = Array.from(parent.children);
+      const index = children.indexOf(node);
+      if (index < 0) break;
+      const directions = role === 'user' ? [-1, 1] : [1];
+      for (const step of directions) {
+        for (let i = index + step; i >= 0 && i < children.length; i += step) {
+          const sibling = children[i];
+          if (sibling.contains(node)) break;
+          if (markerRolesIn(sibling, adapter).size > 0) break;
+          const isMessageRoot = (adapter.pickRootSelectors || []).some((selector) => {
+            try {
+              return sibling.matches(selector);
+            } catch {
+              return false;
+            }
+          });
+          if (isMessageRoot) break;
+          if (!hasMedia(sibling)) continue;
+          addWithin(sibling);
+        }
+      }
+      node = parent;
+    }
+    return media;
+  }
+
+  function appendExtraMedia(wrapper, rootNode, contentNode, baseUrl, role, adapter) {
     if (!rootNode || !rootNode.querySelectorAll) return;
-    const existing = new Set(Array.from(wrapper.querySelectorAll('img, video, audio')).map((el) => el.getAttribute('src')).filter(Boolean));
+    const existing = new Set(Array.from(wrapper.querySelectorAll('img, video, audio'))
+      .map((el) => el.getAttribute('src'))
+      .filter(Boolean));
+    const seen = new Set();
     const extras = [];
-    for (const el of Array.from(rootNode.querySelectorAll('img, video, audio'))) {
+    for (const el of Array.from(rootNode.querySelectorAll('img, video, audio, canvas'))) {
       if (contentNode.contains(el)) continue;
       if (!isLikelyContentMedia(el)) continue;
-      const src = el.currentSrc || el.getAttribute('src') || el.getAttribute('data-src') || '';
-      if (src && existing.has(toAbsoluteUrl(src, baseUrl))) continue;
-      extras.push(el);
+      const src = el.currentSrc || el.getAttribute('src') || el.getAttribute('data-src')
+        || el.getAttribute('data-original') || el.getAttribute('data-lazy-src') || '';
+      const absolute = src ? toAbsoluteUrl(src, baseUrl) : '';
+      if (absolute && (existing.has(absolute) || seen.has(absolute))) continue;
+      if (absolute) seen.add(absolute);
+      extras.push({ kind: 'element', el, src });
+    }
+    const backgroundSelector = [
+      '[style*="background-image"]', '[class*="image"]', '[class*="img"]',
+      '[class*="thumb"]', '[class*="preview"]', '[class*="media"]'
+    ].join(',');
+    for (const el of Array.from(rootNode.querySelectorAll(backgroundSelector))) {
+      if (contentNode.contains(el)) continue;
+      if (!isLikelyContentMedia(el)) continue;
+      const background = elementBackgroundSource(el);
+      if (!background) continue;
+      const absolute = toAbsoluteUrl(background, baseUrl);
+      if (!absolute || existing.has(absolute) || seen.has(absolute)) continue;
+      seen.add(absolute);
+      extras.push({ kind: 'background', el, src: absolute });
+    }
+    if (!extras.length) {
+      for (const adjacent of collectAdjacentMedia(contentNode, role, adapter)) {
+        if (adjacent.kind === 'background') {
+          const absolute = toAbsoluteUrl(elementBackgroundSource(adjacent.el), baseUrl);
+          if (!absolute || existing.has(absolute) || seen.has(absolute)) continue;
+          seen.add(absolute);
+          extras.push({ kind: 'background', el: adjacent.el, src: absolute });
+          continue;
+        }
+        const el = adjacent.el;
+        const src = el.currentSrc || el.getAttribute('src') || el.getAttribute('data-src')
+          || el.getAttribute('data-original') || el.getAttribute('data-lazy-src') || '';
+        const absolute = src ? toAbsoluteUrl(src, baseUrl) : '';
+        if (absolute && (existing.has(absolute) || seen.has(absolute))) continue;
+        if (absolute) seen.add(absolute);
+        extras.push({ kind: 'element', el, src });
+      }
     }
     if (!extras.length) return;
 
     const gallery = document.createElement('div');
     gallery.className = 'attachment-gallery';
-    for (const el of extras) {
-      const clone = sanitizeNode(el, baseUrl);
+    for (const extra of extras) {
+      if (extra.kind === 'background') {
+        const img = document.createElement('img');
+        img.setAttribute('src', extra.src);
+        img.setAttribute('loading', 'lazy');
+        const alt = extra.el.getAttribute('aria-label') || extra.el.getAttribute('title') || '';
+        if (alt) img.setAttribute('alt', alt);
+        gallery.appendChild(img);
+        existing.add(extra.src);
+        continue;
+      }
+      const clone = sanitizeNode(extra.el, baseUrl);
       gallery.appendChild(clone);
       const src = clone.getAttribute('src');
       if (src) existing.add(src);
     }
-    wrapper.appendChild(gallery);
+    if (gallery.children.length) wrapper.appendChild(gallery);
   }
 
-  function renderMessageContent(message, baseUrl) {
+  function renderMessageContent(message, baseUrl, adapter) {
     const wrapper = document.createElement('div');
     wrapper.className = `message-content${message.role === 'user' ? ' plain-text' : ''}`;
     const clone = sanitizeNode(message.contentNode, baseUrl);
     wrapper.appendChild(clone);
-    appendExtraMedia(wrapper, message.rootNode, message.contentNode, baseUrl);
+    appendExtraMedia(wrapper, message.rootNode, message.contentNode, baseUrl, message.role, adapter);
     return wrapper;
   }
 
@@ -1262,6 +1537,352 @@ body.theme-compact .message-content { font-size: 14px; line-height: 1.6; }
       reader.onerror = () => reject(reader.error || new Error('FileReader failed'));
       reader.readAsDataURL(blob);
     });
+  }
+
+  function gifColorIndex(red, green, blue) {
+    return ((red >> 5) << 5) | ((green >> 5) << 2) | (blue >> 6);
+  }
+
+  function gifPalette() {
+    const palette = new Uint8Array(256 * 3);
+    for (let index = 0; index < 256; index += 1) {
+      const red = (index >> 5) & 0x07;
+      const green = (index >> 2) & 0x07;
+      const blue = index & 0x03;
+      palette[index * 3] = Math.round((red * 255) / 7);
+      palette[index * 3 + 1] = Math.round((green * 255) / 7);
+      palette[index * 3 + 2] = Math.round((blue * 255) / 3);
+    }
+    return palette;
+  }
+
+  function gifLzwEncode(indices, minimumCodeSize) {
+    const clearCode = 1 << minimumCodeSize;
+    const endCode = clearCode + 1;
+    let codeSize = minimumCodeSize + 1;
+    let nextCode = endCode + 1;
+    let dictionary = new Map();
+    const bytes = [];
+    let bitBuffer = 0;
+    let bitCount = 0;
+
+    const writeCode = (code) => {
+      bitBuffer |= code << bitCount;
+      bitCount += codeSize;
+      while (bitCount >= 8) {
+        bytes.push(bitBuffer & 0xFF);
+        bitBuffer >>= 8;
+        bitCount -= 8;
+      }
+      if (nextCode > (1 << codeSize) - 1 && codeSize < 12) codeSize += 1;
+    };
+
+    writeCode(clearCode);
+    let prefix = indices[0];
+    for (let index = 1; index < indices.length; index += 1) {
+      const suffix = indices[index];
+      const key = prefix * 256 + suffix;
+      if (dictionary.has(key)) {
+        prefix = dictionary.get(key);
+        continue;
+      }
+      writeCode(prefix);
+      if (nextCode < 4096) {
+        dictionary.set(key, nextCode);
+        nextCode += 1;
+      } else {
+        writeCode(clearCode);
+        dictionary = new Map();
+        nextCode = endCode + 1;
+        codeSize = minimumCodeSize + 1;
+      }
+      prefix = suffix;
+    }
+    writeCode(prefix);
+    writeCode(endCode);
+    if (bitCount > 0) bytes.push(bitBuffer & 0xFF);
+    return bytes;
+  }
+
+  function encodeGif(frames, width, height, delayCentiseconds) {
+    const palette = gifPalette();
+    const bytes = [];
+    const pushText = (text) => {
+      for (let index = 0; index < text.length; index += 1) bytes.push(text.charCodeAt(index));
+    };
+    pushText('GIF89a');
+    bytes.push(width & 0xFF, (width >> 8) & 0xFF, height & 0xFF, (height >> 8) & 0xFF, 0xF7, 0, 0);
+    for (const value of palette) bytes.push(value);
+    bytes.push(0x21, 0xFF, 0x0B);
+    pushText('NETSCAPE2.0');
+    bytes.push(0x03, 0x01, 0x00, 0x00, 0x00);
+    for (const indices of frames) {
+      const delay = Math.max(2, Math.min(65535, Math.round(delayCentiseconds)));
+      bytes.push(0x21, 0xF9, 0x04, 0x04, delay & 0xFF, (delay >> 8) & 0xFF, 0x00, 0x00);
+      bytes.push(
+        0x2C, 0, 0, 0, 0,
+        width & 0xFF, (width >> 8) & 0xFF,
+        height & 0xFF, (height >> 8) & 0xFF,
+        0x00
+      );
+      bytes.push(0x08);
+      const data = gifLzwEncode(indices, 8);
+      for (let offset = 0; offset < data.length; offset += 255) {
+        const chunk = data.slice(offset, offset + 255);
+        bytes.push(chunk.length, ...chunk);
+      }
+      bytes.push(0x00);
+    }
+    bytes.push(0x3B);
+    return new Uint8Array(bytes);
+  }
+
+  function videoSourceUrl(video) {
+    if (!video) return '';
+    const direct = video.currentSrc || video.getAttribute('src') || '';
+    if (direct) return toAbsoluteUrl(direct, location.href);
+    const source = video.querySelector ? video.querySelector('source[src]') : null;
+    return source ? toAbsoluteUrl(source.getAttribute('src') || '', location.href) : '';
+  }
+
+  function loadCaptureVideo(url) {
+    return new Promise((resolve) => {
+      const video = document.createElement('video');
+      video.muted = true;
+      video.playsInline = true;
+      video.preload = 'auto';
+      if (!/^(blob:|data:)/i.test(url)) video.crossOrigin = 'anonymous';
+      let settled = false;
+      const finish = (ok) => {
+        if (settled) return;
+        settled = true;
+        video.removeEventListener('loadeddata', onReady);
+        video.removeEventListener('error', onError);
+        clearTimeout(timer);
+        if (ok) {
+          resolve(video);
+          return;
+        }
+        video.removeAttribute('src');
+        try {
+          video.load();
+        } catch {}
+        resolve(null);
+      };
+      const onReady = () => finish(true);
+      const onError = () => finish(false);
+      const timer = setTimeout(() => finish(false), 6000);
+      video.addEventListener('loadeddata', onReady, { once: true });
+      video.addEventListener('error', onError, { once: true });
+      video.src = url;
+    });
+  }
+
+  function seekVideo(video, time) {
+    return new Promise((resolve) => {
+      let settled = false;
+      const finish = (ok) => {
+        if (settled) return;
+        settled = true;
+        video.removeEventListener('seeked', onSeeked);
+        video.removeEventListener('error', onError);
+        clearTimeout(timer);
+        resolve(ok);
+      };
+      const onSeeked = () => finish(true);
+      const onError = () => finish(false);
+      const timer = setTimeout(() => finish(video.readyState >= 2), 1800);
+      video.addEventListener('seeked', onSeeked);
+      video.addEventListener('error', onError);
+      if (Math.abs((video.currentTime || 0) - time) < 0.01) {
+        finish(video.readyState >= 2);
+        return;
+      }
+      try {
+        video.currentTime = time;
+      } catch {
+        finish(false);
+      }
+    });
+  }
+
+  function readFrameIndices(source, context, width, height) {
+    try {
+      context.drawImage(source, 0, 0, width, height);
+      const data = context.getImageData(0, 0, width, height).data;
+      const indices = new Uint8Array(width * height);
+      for (let index = 0, offset = 0; index < indices.length; index += 1, offset += 4) {
+        indices[index] = gifColorIndex(data[offset], data[offset + 1], data[offset + 2]);
+      }
+      return indices;
+    } catch {
+      return null;
+    }
+  }
+
+  async function captureVideoFrames(video) {
+    const width = video.videoWidth || 0;
+    const height = video.videoHeight || 0;
+    if (!width || !height) return null;
+    const scale = Math.min(1, 480 / width, 320 / height);
+    const targetWidth = Math.max(1, Math.round(width * scale));
+    const targetHeight = Math.max(1, Math.round(height * scale));
+    const canvas = document.createElement('canvas');
+    canvas.width = targetWidth;
+    canvas.height = targetHeight;
+    const context = canvas.getContext('2d', { willReadFrequently: true });
+    if (!context) return null;
+    const duration = Number.isFinite(video.duration) && video.duration > 0 ? video.duration : 0;
+    const previewSeconds = duration > 0 ? Math.min(duration, 6) : 0;
+    const frameCount = previewSeconds > 0
+      ? Math.min(12, Math.max(3, Math.round(previewSeconds * 2)))
+      : 1;
+    const times = [];
+    if (previewSeconds > 0) {
+      for (let index = 0; index < frameCount; index += 1) {
+        times.push((previewSeconds * (index + 0.5)) / frameCount);
+      }
+    } else {
+      times.push(0);
+    }
+    const frames = [];
+    for (const time of times) {
+      if (!(await seekVideo(video, time))) continue;
+      const frame = readFrameIndices(video, context, targetWidth, targetHeight);
+      if (frame) frames.push(frame);
+    }
+    if (!frames.length) {
+      const frame = readFrameIndices(video, context, targetWidth, targetHeight);
+      if (frame) frames.push(frame);
+    }
+    if (!frames.length) return null;
+    const naturalDelay = previewSeconds > 0 ? (previewSeconds / frames.length) * 100 : 100;
+    return {
+      frames,
+      width: targetWidth,
+      height: targetHeight,
+      delay: Math.max(2, Math.min(100, Math.round(naturalDelay)))
+    };
+  }
+
+  function loadImageElement(url) {
+    return new Promise((resolve) => {
+      const image = new Image();
+      if (!/^(blob:|data:)/i.test(url)) image.crossOrigin = 'anonymous';
+      let settled = false;
+      const finish = (ok) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve(ok ? image : null);
+      };
+      const timer = setTimeout(() => finish(false), 6000);
+      image.onload = () => finish(true);
+      image.onerror = () => finish(false);
+      image.src = url;
+    });
+  }
+
+  async function createImageGifPreview(url) {
+    const image = await loadImageElement(url);
+    if (!image) return '';
+    const width = image.naturalWidth || image.width || 0;
+    const height = image.naturalHeight || image.height || 0;
+    if (!width || !height) return '';
+    const scale = Math.min(1, 480 / width, 320 / height);
+    const targetWidth = Math.max(1, Math.round(width * scale));
+    const targetHeight = Math.max(1, Math.round(height * scale));
+    const canvas = document.createElement('canvas');
+    canvas.width = targetWidth;
+    canvas.height = targetHeight;
+    const context = canvas.getContext('2d', { willReadFrequently: true });
+    if (!context) return '';
+    const frame = readFrameIndices(image, context, targetWidth, targetHeight);
+    if (!frame) return '';
+    const encoded = encodeGif([frame], targetWidth, targetHeight, 100);
+    return readBlobAsDataUrl(new Blob([encoded], { type: 'image/gif' }));
+  }
+
+  async function createCurrentVideoGifPreview(video) {
+    const width = video.videoWidth || 0;
+    const height = video.videoHeight || 0;
+    if (!width || !height || video.readyState < 2) return '';
+    const scale = Math.min(1, 480 / width, 320 / height);
+    const targetWidth = Math.max(1, Math.round(width * scale));
+    const targetHeight = Math.max(1, Math.round(height * scale));
+    const canvas = document.createElement('canvas');
+    canvas.width = targetWidth;
+    canvas.height = targetHeight;
+    const context = canvas.getContext('2d', { willReadFrequently: true });
+    if (!context) return '';
+    const frame = readFrameIndices(video, context, targetWidth, targetHeight);
+    if (!frame) return '';
+    const encoded = encodeGif([frame], targetWidth, targetHeight, 100);
+    return readBlobAsDataUrl(new Blob([encoded], { type: 'image/gif' }));
+  }
+
+  async function createVideoGifPreview(sourceVideo) {
+    if (!sourceVideo || sourceVideo.tagName !== 'VIDEO') return '';
+    const source = videoSourceUrl(sourceVideo);
+    if (source) {
+      const capture = await loadCaptureVideo(source);
+      if (capture) {
+        try {
+          const result = await captureVideoFrames(capture);
+          if (result) {
+            const encoded = encodeGif(result.frames, result.width, result.height, result.delay);
+            return await readBlobAsDataUrl(new Blob([encoded], { type: 'image/gif' }));
+          }
+        } finally {
+          capture.removeAttribute('src');
+          try {
+            capture.load();
+          } catch {}
+        }
+      }
+    }
+    const currentFrame = await createCurrentVideoGifPreview(sourceVideo);
+    if (currentFrame) return currentFrame;
+    const poster = sourceVideo.getAttribute('poster') || '';
+    const posterUrl = poster ? toAbsoluteUrl(poster, location.href) : '';
+    if (posterUrl) {
+      const preview = await createImageGifPreview(posterUrl);
+      if (preview) return preview;
+    }
+    return '';
+  }
+
+  async function inlineVideoPreviews(videos) {
+    const list = Array.from(new Set(videos)).filter((video) => video && video.tagName === 'VIDEO');
+    if (!list.length) return;
+    const results = new Map();
+    let cursor = 0;
+    const deadline = Date.now() + 30000;
+    const workerCount = Math.min(3, list.length);
+    const workers = Array.from({ length: workerCount }, async () => {
+      while (cursor < list.length && Date.now() < deadline) {
+        const index = cursor;
+        cursor += 1;
+        const video = list[index];
+        try {
+          const dataUrl = await createVideoGifPreview(video.__aiceSourceVideo);
+          if (dataUrl) results.set(video, dataUrl);
+        } catch (error) {
+          console.warn('[AI Chat Exporter] Could not create video preview:', error);
+        }
+      }
+    });
+    await Promise.all(workers);
+    for (const video of list) {
+      const dataUrl = results.get(video);
+      if (!dataUrl) continue;
+      const image = document.createElement('img');
+      image.className = 'video-preview';
+      image.setAttribute('src', dataUrl);
+      const alt = video.getAttribute('aria-label') || video.getAttribute('title') || 'Video preview';
+      image.setAttribute('alt', alt);
+      video.replaceWith(image);
+    }
   }
 
   function gmRequestAsDataUrl(url, timeoutMs) {
@@ -1358,15 +1979,15 @@ body.theme-compact .message-content { font-size: 14px; line-height: 1.6; }
 
     const results = new Map();
     let cursor = 0;
-    const deadline = Date.now() + 20000;
-    const workerCount = Math.min(4, urls.length);
+    const deadline = Date.now() + 30000;
+    const workerCount = Math.min(5, urls.length);
     const workers = Array.from({ length: workerCount }, async () => {
       while (cursor < urls.length && Date.now() < deadline) {
         const index = cursor;
         cursor += 1;
         const url = urls[index];
         try {
-          results.set(url, await fetchAsDataUrl(url, 10000));
+          results.set(url, await fetchAsDataUrl(url, 12000));
         } catch (error) {
           console.warn('[AI Chat Exporter] Could not embed image:', url, error);
         }
@@ -1378,6 +1999,9 @@ body.theme-compact .message-content { font-size: 14px; line-height: 1.6; }
       const src = img.getAttribute('src');
       if (src && results.has(src)) {
         img.setAttribute('src', results.get(src));
+      } else if (src && !/^data:/i.test(src)) {
+        const dataUrl = loadedImageDataUrl(img.__aiceSourceImage);
+        if (dataUrl) img.setAttribute('src', dataUrl);
       }
       img.removeAttribute('srcset');
       img.removeAttribute('sizes');
@@ -1389,14 +2013,17 @@ body.theme-compact .message-content { font-size: 14px; line-height: 1.6; }
     const baseUrl = location.href;
     const prepared = messages.map((message) => ({
       message,
-      wrapper: renderMessageContent(message, baseUrl)
+      wrapper: renderMessageContent(message, baseUrl, adapter)
     }));
 
     const images = [];
+    const videos = [];
     for (const item of prepared) {
       images.push(...Array.from(item.wrapper.querySelectorAll('img')));
+      videos.push(...Array.from(item.wrapper.querySelectorAll('video')));
     }
     await inlineImages(images, baseUrl, options.embed);
+    await inlineVideoPreviews(videos);
 
     const needsMath = prepared.some((item) => item.wrapper.querySelector('.katex, mjx-container, math'));
     const exportDate = new Date();
