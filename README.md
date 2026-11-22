@@ -32,6 +32,7 @@ If the automatic detection misses a chat layout, click **Pick on page**, then cl
 
 - The exporter captures the messages that are currently in the page DOM. For virtualized conversations, scroll through the parts you need first, then open the exporter. If a reply is still streaming, wait for it to finish and press **Refresh** in the dialog.
 - Image embedding uses `GM_xmlhttpRequest` (hence the broad `@connect *` permission) so images that require your session cookies can be inlined. If an image cannot be fetched, its original URL is kept.
+- Uploaded and generated videos are exported as short animated GIF previews. The exporter samples the first few seconds of each video. If the browser cannot decode the frames, the video poster is used instead.
 - The exported HTML is self-contained except for the optional KaTeX stylesheet, which is loaded from jsDelivr when mathematical formulas are present.
 - Everything runs locally in the browser; no chat content is uploaded anywhere.
 
